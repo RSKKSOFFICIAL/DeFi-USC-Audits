@@ -33,40 +33,80 @@ contract LendingPoolTest is Test {
     address bob;
 
     function setUp() public {
+        // --- Setup test accounts ---
         alice = address(0xA11ce);
         bob = address(0xB0b);
 
-        // deploy oracle + pool
+        // --- Deploy Oracle and LendingPool ---
         oracle = new Oracle();
         pool = new LendingPool(address(oracle));
 
-        // deploy mocks
-        dai = new MockERC20("Mock DAI", "DAI", 1e24); // 1M
-        weth = new MockERC20("Mock WETH", "WETH", 1e24);
+        // --- Deploy mock ERC20 tokens ---
+        dai = new MockERC20("Mock DAI", "DAI", 1e24); // 1M DAI
+        weth = new MockERC20("Mock WETH", "WETH", 1e24); // 1M WETH
 
-        // deploy aTokens & debt tokens (owner set to test contract)
+        // --- Deploy AToken and DebtToken (owner initially = this test contract) ---
         aDai = new AToken("aDAI", "aDAI", address(this));
         dDai = new DebtToken("dDAI", "dDAI", address(this));
         aWeth = new AToken("aWETH", "aWETH", address(this));
         dWeth = new DebtToken("dWETH", "dWETH", address(this));
 
-        // set underlying in aTokens
+        // --- Debug logs (optional) ---
+        emit log_named_address("pool owner", pool.owner());
+        emit log_named_address("aDai owner (before)", aDai.owner());
+        emit log_named_address("aWeth owner (before)", aWeth.owner());
+        emit log_named_address("test contract", address(this));
+
+        // --- Set underlying tokens as their owner (address(this) currently owns aTokens) ---
+        // No vm.prank needed: aDai.owner() == address(this)
         aDai.setUnderlying(address(dai));
         aWeth.setUnderlying(address(weth));
 
-        // List reserves
-        pool.listReserve(address(dai), aDai, dDai, InterestRateModel(address(0)), true, 7500, 8000, 10500);
-        pool.listReserve(address(weth), aWeth, dWeth, InterestRateModel(address(0)), true, 7000, 7500, 10750);
+        // --- Transfer ownership of aTokens and debt tokens to the pool so pool can call setPool() ---
+        // AToken::setPool is onlyOwner, so the pool must be owner before listReserve.
+        aDai.transferOwnership(address(pool));
+        dDai.transferOwnership(address(pool));
+        aWeth.transferOwnership(address(pool));
+        dWeth.transferOwnership(address(pool));
 
-        // set prices: DAI = $1, WETH = $3000 (prices are 1e8)
-        oracle.setPrice(address(dai), int256(1 * 1e8));
-        oracle.setPrice(address(weth), int256(3000 * 1e8));
+        emit log_named_address("aDai owner (after)", aDai.owner());
+        emit log_named_address("aWeth owner (after)", aWeth.owner());
 
-        // give users tokens
+        // --- Now list reserves as pool owner (pool contract itself executes setPool inside) ---
+        // We must call listReserve from the pool's owner (which currently is address(this)),
+        // because listReserve itself may be onlyOwner on the pool — but in your contracts pool.owner() is address(this).
+        // So call normally (address(this) is the owner of pool in these tests).
+        // If pool.owner() were different we'd vm.prank(pool.owner()) around these calls.
+        pool.listReserve(
+            address(dai),
+            aDai,
+            dDai,
+            InterestRateModel(address(0)),
+            true,
+            7500,
+            8000,
+            10500
+        );
+        pool.listReserve(
+            address(weth),
+            aWeth,
+            dWeth,
+            InterestRateModel(address(0)),
+            true,
+            7000,
+            7500,
+            10750
+        );
+
+        // --- Set prices in oracle ---
+        oracle.setPrice(address(dai), int256(1 * 1e8)); // DAI = $1
+        oracle.setPrice(address(weth), int256(3000 * 1e8)); // WETH = $3000
+
+        // --- Mint tokens to users ---
         dai.mint(alice, 1000 ether);
         weth.mint(bob, 10 ether);
 
-        // approve pool transfers (simulate user approvals)
+        // --- Approve pool for transfers from users ---
         vm.prank(alice);
         dai.approve(address(pool), type(uint256).max);
         vm.prank(bob);
@@ -74,34 +114,32 @@ contract LendingPoolTest is Test {
     }
 
     function testDepositBorrowRepayWithdraw() public {
-        // alice deposits 1000 DAI
+        // --- Alice deposits 1000 DAI ---
         vm.prank(alice);
         pool.deposit(address(dai), 1000 ether);
+        assertEq(aDai.balanceOf(alice), 1000 ether, "aDAI balance mismatch");
 
-        // ensure aToken balance
-        assertEq(aDai.balanceOf(alice), 1000 ether);
-
-        // bob deposits 10 WETH
+        // --- Bob deposits 10 WETH ---
         vm.prank(bob);
         pool.deposit(address(weth), 10 ether);
-        assertEq(aWeth.balanceOf(bob), 10 ether);
+        assertEq(aWeth.balanceOf(bob), 10 ether, "aWETH balance mismatch");
 
-        // bob borrows 1000 DAI (collateral WETH: 10 * $3000 = $30,000; with LTV 70% -> $21,000 available)
+        // --- Bob borrows 1000 DAI ---
         vm.prank(bob);
         pool.borrow(address(dai), 1000 ether);
-        assertEq(dDai.balanceOf(bob), 1000 ether);
+        assertEq(dDai.balanceOf(bob), 1000 ether, "debt token mismatch");
 
-        // bob repays 500 DAI
+        // --- Bob repays 500 DAI ---
         dai.mint(bob, 500 ether);
         vm.prank(bob);
         dai.approve(address(pool), 500 ether);
         vm.prank(bob);
         pool.repay(address(dai), 500 ether);
-        assertEq(dDai.balanceOf(bob), 500 ether);
+        assertEq(dDai.balanceOf(bob), 500 ether, "partial repay mismatch");
 
-        // alice withdraws 100 DAI
+        // --- Alice withdraws 100 DAI ---
         vm.prank(alice);
         pool.withdraw(address(dai), 100 ether);
-        assertEq(aDai.balanceOf(alice), 900 ether);
+        assertEq(aDai.balanceOf(alice), 900 ether, "withdraw mismatch");
     }
 }
