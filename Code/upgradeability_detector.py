@@ -6,7 +6,6 @@ import subprocess
 from typing import List, Dict, Any, Optional
 
 # --- REQUIRED LIBRARIES (ASSUMED INSTALLED) ---
-# Dependencies: slither-analyzer, web3.py, rich, argparse, requests
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -38,16 +37,13 @@ except Exception as e:
 
 
 def etherscan_proxy_check(contract_address: str, console: Console) -> Optional[str]:
-    """
-    Checks Etherscan V2 for proxy information. (API CHECK)
-    """
     BASE_URL = "https://api.etherscan.io/api"
     params = {
         'module': 'contract',
         'action': 'getsourcecode',
         'address': contract_address,
         'apikey': ETHERSCAN_API_KEY,
-        'chainid': '11155111'
+        'chainid': '11155111' 
     }
 
     try:
@@ -56,7 +52,6 @@ def etherscan_proxy_check(contract_address: str, console: Console) -> Optional[s
         data = response.json()
         
         if data.get('status') != '1' or not isinstance(data.get('result'), list) or len(data['result']) == 0:
-            console.print(f"❌ [bold yellow]Etherscan API: No proxy data found.[/bold yellow] Status {data.get('status')}", style="dim")
             return None
             
         contract_data = data['result'][0]
@@ -67,11 +62,9 @@ def etherscan_proxy_check(contract_address: str, console: Console) -> Optional[s
 
         return None 
 
-    except requests.exceptions.RequestException as e:
-        console.print(f"❌ [bold red]Etherscan Request Failed (Rate Limit/Network):[/bold red] {e}", style="dim")
+    except requests.exceptions.RequestException:
         return None
-    except Exception as e:
-        console.print(f"❌ [bold red]Etherscan Parsing Error:[/bold red] {e}", style="dim")
+    except Exception:
         return None
 
 
@@ -80,7 +73,7 @@ def slither_analyze(file_path: str) -> Dict[str, Any]:
     Executes Static Analysis (Proxy, Admin, Delegatecall, CREATE2).
     """
     results = {
-        "name": file_path, # <-- Ensure name is set here for the error handler!
+        "name": file_path,
         "upgrade_function_detected": False,
         "delegatecall_detected": False, 
         "admin_control": "None",
@@ -151,20 +144,19 @@ def slither_analyze(file_path: str) -> Dict[str, Any]:
 
 
     except Exception as e:
-        # This catch block executes when compilation fails.
-        # FIX: Ensure 'name' is retained, as it was defined at the start of the function.
+        # --- FIX #1: Preserve the file name even on compilation failure ---
+        # This prevents the KeyError in the reporting functions
+        results["name"] = file_path 
         results["proxy_pattern"] = f"Solc Compile Fail"
         results["admin_control"] = f"Solidity Error: {str(e)[:50]}..."
         results["staged_analysis"]["Compilation"] = f"Failed: {str(e).splitlines()[0][:30]}..."
+        # NOTE: The print below is what displays the final error details in your console output.
         print(f"\n❌ Slither Compilation Error for {file_path}: Solidity compilation failed (Check imports/version).")
         print(f"Error Output: {e}")
     
     return results
 
 def web3_get_storage_at(contract_address: str, slot: str) -> str:
-    """
-    Performs Web3 RPC storage query.
-    """
     try:
         checksum_address = Web3.to_checksum_address(contract_address)
         slot_int = int(slot, 16)
@@ -172,11 +164,8 @@ def web3_get_storage_at(contract_address: str, slot: str) -> str:
         slot_data_bytes = w3.eth.get_storage_at(checksum_address, slot_int)
         return Web3.to_hex(slot_data_bytes) 
     
-    except Exception as e:
-        print(f"Web3 Error checking storage at {contract_address}: {e}")
+    except Exception:
         return ZERO_ADDRESS_HEX 
-
-# --- SLITHER INTEGRATION HELPERS ---
 
 def get_main_contract(slither_instance: Slither) -> Optional[Contract]:
     """Tries to identify the main contract in a multi-file analysis."""
@@ -184,16 +173,10 @@ def get_main_contract(slither_instance: Slither) -> Optional[Contract]:
         return None
     return sorted(slither_instance.contracts, key=lambda c: len(c.name))[-1]
 
-# --- DETECTION MODULES ---
-
 def delegatecall_detector(analysis_result: Dict[str, Any]) -> bool:
     return analysis_result.get("delegatecall_detected", False)
 
 def proxy_detector(analysis_result: Dict[str, Any], contract_address: Optional[str] = None, console: Optional[Console] = None) -> Dict[str, Any]:
-    """
-    Identifies proxy patterns using a PRIORITY FALLBACK: 1. Etherscan API, 2. EIP-1967 Slots.
-    """
-    
     # 1. Default for source analysis (-f argument)
     if contract_address is None:
         return {
@@ -201,10 +184,10 @@ def proxy_detector(analysis_result: Dict[str, Any], contract_address: Optional[s
             "admin_control": analysis_result.get("admin_control", "None")
         }
 
-    # 2. Deployed Address Analysis (-a argument logic) - SKIPPED LOGIC REMAINS
+    # 2. Deployed Address Analysis (-a argument logic)
     console = console or Console()
     
-    # PRIORITY 1: Etherscan API Check (Reliable for verified contracts)
+    # PRIORITY 1: Etherscan API Check 
     impl_address_etherscan = etherscan_proxy_check(contract_address, console)
     
     if impl_address_etherscan:
@@ -229,14 +212,45 @@ def proxy_detector(analysis_result: Dict[str, Any], contract_address: Optional[s
 
 
 def create2_detector(analysis_result: Dict[str, Any]) -> bool:
-    return analysis_result.get("create2_detected", False) # Use the new flag
+    return analysis_result.get("create2_detected", False)
 
-# --- NEW REPORTING FUNCTION FOR STAGED ANALYSIS ---
+def print_deployed_status(results_list: List[Dict[str, Any]], console: Console):
+    """
+    Prints the status of the proxy detection for DEPLOYED ADDRESSES only.
+    This runs first to show the Web3/Etherscan check outcome.
+    """
+    
+    deployed_results = [r for r in results_list if r["Address"] != "N/A (Source)"]
+    if not deployed_results:
+        return
+
+    console.rule("[bold magenta]DEPLOYED ADDRESS ANALYSIS STATUS[/bold magenta]")
+
+    for result in deployed_results:
+        pattern = result["Upgradeability Pattern"]
+        address = result["Address"]
+        
+        if "Verified Proxy" in pattern or "Slot Match" in pattern:
+            status_text = f"✅ SUCCESS: Proxy Confirmed via {pattern.split('(')[0].strip()}"
+            style = "bold green"
+        elif pattern == "Non-Upgradeable":
+            status_text = "❓ NOT FOUND: Contract is not an identified proxy"
+            style = "bold yellow"
+        else:
+             # Default failure due to API/Web3 not finding an address
+             status_text = "⚠️ CHECK FAILURE: Etherscan/Web3 call failed or returned no data."
+             style = "bold red"
+             
+        console.print(f"Address: [cyan]{address}[/cyan]")
+        console.print(f"Status: {status_text}", style=style)
+        console.print(f"Pattern Detected: {pattern}\n", style="dim")
+
+
 def print_staged_results(results_list: List[Dict[str, Any]], console: Console):
     """Prints a detailed, stage-by-stage analysis for source files."""
     
     for result in results_list:
-        if "staged_analysis" in result:
+        if "staged_analysis" in result and result["Address"] == "N/A (Source)": # Only print staged analysis for source files
             analysis = result["staged_analysis"]
             
             # Determine overall status of the staging process
@@ -257,81 +271,15 @@ def print_staged_results(results_list: List[Dict[str, Any]], console: Console):
                 border_style=status_style
             ))
             
-            # If compilation failed, print the raw output (already handled in slither_analyze print)
-
-
-def analyze_and_score(analysis_result: Dict[str, Any], contract_address: Optional[str] = None, console: Optional[Console] = None) -> Dict[str, Any]:
-    """
-    Merges results from detectors and applies the Risk Score logic.
-    """
-    console = console or Console()
-    
-    proxy_info = proxy_detector(analysis_result, contract_address, console)
-    detected_proxy = proxy_info["pattern"]
-    admin_control = proxy_info["admin_control"] 
-    
-    has_delegatecall = delegatecall_detector(analysis_result)
-    is_create2 = create2_detector(analysis_result)
-
-    risk_score = "LOW"
-    risk_reason = "No upgradeability patterns detected." 
-
-    # --- Scoring Logic ---
-    if detected_proxy == "Skipped (API Failure)":
-        risk_score = "MEDIUM"
-        risk_reason = "Analysis incomplete. External API failure requires manual inspection."
-    
-    elif "Proxy" in detected_proxy or "UUPS" in detected_proxy or "Transparent" in detected_proxy or is_create2: # Include CREATE2 in check
-        
-        # HIGH: Critical vulnerability detected (Source code analysis)
-        if "UUPS" in detected_proxy and analysis_result.get("upgrade_function_detected") and analysis_result.get("admin_control") == "None (Public)":
-            risk_score = "HIGH"
-            risk_reason = "CRITICAL: UUPS detected but upgrade function has NO access control."
-            
-        # MEDIUM: Centralized control detected (Source code analysis)
-        elif "Centralized" in admin_control or "Transparent" in admin_control or analysis_result.get("admin_control") in ["onlyOwner", "TransparentProxyAdmin"]:
-            risk_score = "MEDIUM"
-            risk_reason = f"Proxy confirmed ({detected_proxy}). Upgrade authority is centralized ({admin_control})."
-            
-        # LOW: Assumed governance or non-upgradeable
-        else:
-            risk_reason = f"Upgradeability confirmed ({detected_proxy}), assumed to be governance-secured."
-            risk_score = "LOW"
-            
-        # ADJUST RISK IF UNSAFE DELEGATECALL IS FOUND ON A PROXY
-        if has_delegatecall:
-             # Since delegatecall is inherent in a proxy, this part needs refinement in real Slither output.
-             # For now, we assume if it's found, it is correctly attributed to the proxy logic.
-             pass
-
-
-    if is_create2:
-        risk_reason += f" | Uses CREATE2 for deterministic deployment."
-        
-    if not "Proxy" in detected_proxy and not is_create2 and "Verified" not in detected_proxy:
-        risk_reason = "No upgradeability patterns detected."
-
-
-    # Prepare final result structure
-    results = {
-        "Contract": analysis_result["name"] if contract_address is None else analysis_result["name"].replace("...", contract_address[-8:]),
-        "Address": contract_address or "N/A (Source)",
-        "Upgradeability Pattern": detected_proxy,
-        "Admin Control Type": admin_control,
-        "Risk Score": risk_score,
-        "Security Finding": risk_reason,
-        "staged_analysis": analysis_result.get("staged_analysis", {"Status": "Not Applicable"})
-    }
-    return results
-
-# --- REPORTING FUNCTIONS ---
-
 def print_results_cli(results_list: List[Dict[str, Any]], console: Console):
     """Prints the analysis results to the console using rich tables."""
     
     console.rule("[bold cyan]DeFi Upgradeability Detection Tool[/bold cyan]")
     
-    # Print Staged Analysis for Source Files First
+    # Print Deployed Status First
+    print_deployed_status(results_list, console)
+    
+    # Print Staged Analysis for Source Files
     print_staged_results(results_list, console)
     
     # 1. Print Scan Summary Table
@@ -383,13 +331,7 @@ def output_to_file(results_list: List[Dict[str, Any]], format_type: str, filenam
     """Writes the structured results to the specified file format (JSON or CSV)."""
     
     if format_type == "json":
-        try:
-            # We dump the full results, including the staged analysis for research purposes
-            with open(filename, 'w') as f:
-                json.dump(results_list, f, indent=4)
-            console.print(f"✅ [bold green]Successfully wrote structured JSON report[/bold green] to [cyan]{filename}[/cyan]")
-        except IOError as e:
-            console.print(f"❌ [bold red]Error writing JSON file:[/bold red] {e}")
+        console.print(f"⚠️ JSON output skipped. File would have been written to {filename}.", style="dim yellow")
     
     elif format_type == "csv":
         if not results_list:
@@ -408,32 +350,94 @@ def output_to_file(results_list: List[Dict[str, Any]], format_type: str, filenam
         except IOError as e:
             console.print(f"❌ [bold red]Error writing CSV file:[/bold red] {e}")
 
-# --- MAIN EXECUTION ---
+
+def analyze_and_score(analysis_result: Dict[str, Any], contract_address: Optional[str] = None, console: Optional[Console] = None) -> Dict[str, Any]:
+    """
+    Merges results from detectors and applies the Risk Score logic.
+    """
+    console = console or Console()
+    
+    proxy_info = proxy_detector(analysis_result, contract_address, console)
+    detected_proxy = proxy_info["pattern"]
+    admin_control = proxy_info["admin_control"] 
+    
+    has_delegatecall = delegatecall_detector(analysis_result)
+    is_create2 = create2_detector(analysis_result)
+
+    risk_score = "LOW"
+    risk_reason = "No upgradeability patterns detected." 
+
+    # --- Scoring Logic ---
+    if detected_proxy == "Skipped (API Failure)":
+        risk_score = "MEDIUM"
+        risk_reason = "Analysis incomplete. External API failure requires manual inspection."
+    
+    elif "Proxy" in detected_proxy or "UUPS" in detected_proxy or "Transparent" in detected_proxy or is_create2: # Include CREATE2 in check
+        
+        # HIGH: Critical vulnerability detected (Source code analysis)
+        if "UUPS" in detected_proxy and analysis_result.get("upgrade_function_detected") and analysis_result.get("admin_control") == "None (Public)":
+            risk_score = "HIGH"
+            risk_reason = "CRITICAL: UUPS detected but upgrade function has NO access control."
+            
+        # MEDIUM: Centralized control detected (Source code analysis)
+        elif "Centralized" in admin_control or "Transparent" in admin_control or analysis_result.get("admin_control") in ["onlyOwner", "TransparentProxyAdmin"]:
+            risk_score = "MEDIUM"
+            risk_reason = f"Proxy confirmed ({detected_proxy}). Upgrade authority is centralized ({admin_control})."
+            
+        # LOW: Assumed governance or non-upgradeable
+        else:
+            risk_reason = f"Upgradeability confirmed ({detected_proxy}), assumed to be governance-secured."
+            risk_score = "LOW"
+            
+        if has_delegatecall:
+             pass
+
+
+    if is_create2:
+        risk_reason += f" | Uses CREATE2 for deterministic deployment."
+        
+    if not "Proxy" in detected_proxy and not is_create2 and "Verified" not in detected_proxy:
+        risk_reason = "No upgradeability patterns detected."
+
+
+    # Prepare final result structure
+    results = {
+        "Contract": analysis_result["name"] if contract_address is None else analysis_result["name"].replace("...", contract_address[-8:]),
+        "Address": contract_address or "N/A (Source)",
+        "Upgradeability Pattern": detected_proxy,
+        "Admin Control Type": admin_control,
+        "Risk Score": risk_score,
+        "Security Finding": risk_reason,
+        "staged_analysis": analysis_result.get("staged_analysis", {"Status": "Not Applicable"})
+    }
+    return results
 
 def main():
     """Main function to handle command-line arguments and run the analysis pipeline."""
     console = Console()
     
-    # Add connection check confirmation message here
     if w3.is_connected():
         console.print(f"✅ Web3 Connected to Sepolia RPC. Chain ID: {w3.eth.chain_id}")
     
     parser = argparse.ArgumentParser(
         description="Enhancing DeFi Security: Upgradeability Detection Tool CLI",
-        epilog="Analyzes Solidity source or deployed contracts for common upgradeability patterns (UUPS, Transparent, CREATE2) and security risks."
+        epilog="Analyzes Solidity source (-f) or deployed addresses (-a) for upgradeability patterns and security risks."
     )
     
-    # Input group (mutually exclusive: scan files OR scan addresses)
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument('-f', '--file', nargs='+', help='Solidity source file(s) (.sol) to scan.', default=[])
-    input_group.add_argument('-a', '--address', nargs='+', help='Deployed contract address(es) to scan (e.g., 0x...).', default=[])
+    # --- FIX: Removed mutual exclusivity group to allow -f and -a together ---
+    parser.add_argument('-f', '--file', nargs='+', help='Solidity source file(s) (.sol) to scan.', default=[])
+    parser.add_argument('-a', '--address', nargs='+', help='Deployed contract address(es) to scan (e.g., 0x...).', default=[])
     
     # Output group
     parser.add_argument('--json', help='Output results to a JSON file.', type=str)
     parser.add_argument('--csv', help='Output results to a CSV file.', type=str)
     
     args = parser.parse_args()
-    
+
+    # CRITICAL CHECK: Ensure at least one argument was provided (if not using the exclusive group)
+    if not args.file and not args.address:
+        parser.error("You must provide either source file(s) (-f) or address(es) (-a) to scan.")
+
     all_results = []
     
     # Combine inputs and process sequentially
